@@ -1,0 +1,52 @@
+{
+    "order_id": "ODR-20251128-0EDC57",
+    "customer_name": "Mikasa",
+    "delivery_address": "Rose villa park street",
+    "order_timestamp": "2025-11-28T12:09:56.717578",
+    "status": "Placed",
+    "items": [
+        {
+            "id": "G002",
+            "name": "White Eggs (Pack of 12)",
+            "price_per_unit": 105.0,
+            "quantity_ordered": 1.0,
+            "unit": "dozen",
+            "line_total": 105.0
+        },
+        {
+            "id": "P001",
+            "name": "Margherita Pizza (Ready-to-Bake)",
+            "price_per_unit": 320.0,
+            "quantity_ordered": 2.0,
+            "unit": "each",
+            "line_total": 640.0
+        },
+        {
+            "id": "T003",
+            "name": "Dried Spaghetti Pasta",
+            "price_per_unit": 95.0,
+            "quantity_ordered": 1,
+            "unit": "packet (500g)",
+            "line_total": 95.0
+        },
+        {
+            "id": "T002",
+            "name": "Tomato Pasta Sauce (Marinara)",
+            "price_per_unit": 150.0,
+            "quantity_ordered": 1,
+            "unit": "jar (400g)",
+            "line_total": 150.0
+        },
+        {
+            "id": "G006",
+            "name": "Tomato",
+            "price_per_unit": 65.0,
+            "quantity_ordered": 0.5,
+            "unit": "kilogram",
+            "line_total": 32.5
+        }
+    ],
+    "subtotal": 1022.5,
+    "delivery_fee": 40.0,
+    "grand_total": 1062.5
+}
