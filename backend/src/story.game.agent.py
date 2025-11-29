@@ -1,23 +1,14 @@
-# backend/src/agent.py
 import os
-import json
 import logging
 import asyncio
-import uuid
-from pathlib import Path
+import json
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from pathlib import Path
+from typing import Dict, Any, List
 
 from dotenv import load_dotenv
-load_dotenv(".env.local")
 
-# standard fuzzy matching helper
-import difflib
-
-logger = logging.getLogger("story.agent")
-logger.setLevel(logging.INFO)
-
-# --- LiveKit Agent imports (same as your original) ---
+# LiveKit Agent imports
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -28,294 +19,164 @@ from livekit.agents import (
     function_tool,
     RunContext,
 )
-# LiveKit Plugin imports (same as original)
+# LiveKit Plugin imports
 from livekit.plugins import google, murf, deepgram, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-# --- Story file path (relative to this file's parent parent dir) ---
-STORY_PATH = Path(__file__).parent.parent.joinpath("story.json")
-if not STORY_PATH.exists():
-    logger.error(f"story.json not found at {STORY_PATH}. Please place story.json there.")
-    # Do not raise here so that the worker can start; tools will error gracefully if story not loaded.
+load_dotenv(".env.local")
+# Renamed logger for the new theme
+logger = logging.getLogger("true.crime.investigation.agent")
 
-# --- Load story.json into memory ---
-def load_story() -> Dict[str, Any]:
-    try:
-        with open(STORY_PATH, "r", encoding="utf-8") as f:
-            story = json.load(f)
-            # Ensure scenes is a dict
-            scenes = story.get("scenes", {})
-            return {"meta": {k: story.get(k) for k in ("title", "start_scene")}, "scenes": scenes}
-    except FileNotFoundError:
-        logger.exception("story.json not found.")
-        return {"meta": {}, "scenes": {}}
-    except json.JSONDecodeError:
-        logger.exception("Invalid JSON in story.json.")
-        return {"meta": {}, "scenes": {}}
+# --- Configuration for Saving Case Files ---
+# Renamed directory and variable for the theme
+CASE_FILE_DIR = Path(__file__).parent.joinpath('case_files')
+CASE_FILE_DIR.mkdir(exist_ok=True) # Ensure the directory exists
 
-STORY_DATA = load_story()
+# --- Detective Agent Logic Class (Updated for Case Files) ---
 
-# --- Simple in-memory session store ---
-# session_id -> { "current_scene": str, "created_at": iso, "history": [ {scene, choice_label, choice_id, at} ] }
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-def new_session(start_scene_override: Optional[str] = None) -> str:
-    sid = str(uuid.uuid4())
-    start_scene = start_scene_override or STORY_DATA["meta"].get("start_scene")
-    if not start_scene:
-        # fallback: pick first scene key if available
-        scenes_keys = list(STORY_DATA["scenes"].keys())
-        start_scene = scenes_keys[0] if scenes_keys else None
-    SESSIONS[sid] = {
-        "current_scene": start_scene,
-        "created_at": datetime.utcnow().isoformat(),
-        "history": []
-    }
-    logger.info(f"Created new session {sid} with start_scene={start_scene}")
-    return sid
-
-def get_session(sid: str) -> Optional[Dict[str, Any]]:
-    return SESSIONS.get(sid)
-
-def set_scene_for_session(sid: str, scene_id: Optional[str]):
-    if sid in SESSIONS:
-        SESSIONS[sid]["current_scene"] = scene_id
-
-# --- Helpers for scene/choice lookup ---
-def get_scene(scene_id: str) -> Optional[Dict[str, Any]]:
-    return STORY_DATA["scenes"].get(scene_id)
-
-def format_scene_output(scene: Dict[str, Any]) -> Dict[str, Any]:
+class DetectiveLogic:
     """
-    Normalize scene to a small payload suitable for TTS and agent responses.
+    Manages the Detective Agent's state, including the feature to save case history.
+    The agent acts as the facilitator for the player's investigation.
     """
-    if not scene:
-        return {"id": None, "title": None, "narration": None, "lines": [], "choices": []}
-    choices = scene.get("choices", [])
-    # choices might be list of objects like {id, label, next_scene}
-    formatted_choices = []
-    for c in choices:
-        # support both list-of-dicts and map-style if present
-        if isinstance(c, dict):
-            formatted_choices.append({"id": c.get("id"), "label": c.get("label"), "next_scene": c.get("next_scene")})
-        else:
-            # ignore unexpected shape
-            continue
-    return {
-        "id": scene.get("id"),
-        "title": scene.get("title"),
-        "narration": scene.get("narration"),
-        "lines": scene.get("lines", []),
-        "choices": formatted_choices
-    }
+    def __init__(self):
+        logger.info("Detective Logic initialized for the Andie Bell Cold Case. Case file directory: %s", CASE_FILE_DIR)
 
-def _choice_labels_for_scene(scene: Dict[str, Any]) -> List[str]:
-    formatted = format_scene_output(scene)
-    return [c["label"] for c in formatted["choices"] if c.get("label")]
+    def _get_player_info(self, chat_history: List[Dict[str, Any]]) -> str:
+        """Attempts to extract the player's name/persona, defaulting to the protagonist."""
+        for msg in chat_history:
+            if msg.get('role') == 'user':
+                content = msg.get('content', '').lower()
+                if 'pip' in content or 'pippa' in content:
+                    return "Pip_Fitz-Amobi"
+                
+                # Check for other name suggestions
+                if 'my name is' in content:
+                    name_part = content.split('my name is', 1)[1].split(',')[0].strip()
+                    return name_part.title()
+                
+        return "Pip_Fitz-Amobi" # Default name for A Good Girl's Guide to Murder
 
-# --- Matching logic: map free-form user utterance to best choice ---
-def map_user_input_to_choice(scene: Dict[str, Any], user_input: str, cutoff: float = 0.45) -> Optional[Dict[str, Any]]:
-    """
-    Attempt to map user_input (raw text) to one of the scene's choices.
-    Uses difflib for fuzzy matching on choice labels and also attempts to match on
-    choice ids or short keywords.
-    Returns the matched choice dict or None.
-    """
-    if not scene:
-        return None
-    formatted = format_scene_output(scene)
-    choices = formatted["choices"]
-    if not choices:
-        return None
+    def save_case_state(self, chat_history: List[Dict[str, Any]]) -> str:
+        """Accesses the full chat history and saves it to a JSON case file."""
+        if not chat_history:
+            return "❌ Cannot save: The case history is empty."
 
-    # Build list of candidate strings
-    candidates = []
-    label_to_choice = {}
-    for c in choices:
-        label = c.get("label", "").strip()
-        cid = c.get("id")
-        # Add label as candidate
-        if label:
-            candidates.append(label)
-            label_to_choice[label] = c
-        # Add id as a candidate if present
-        if cid:
-            candidates.append(str(cid))
-            label_to_choice[str(cid)] = c
-
-    # Lowercased matching
-    user_lower = user_input.strip().lower()
-
-    # Fast direct substring match (prefer exact)
-    for lab, ch in label_to_choice.items():
-        if lab.lower() in user_lower or user_lower in lab.lower():
-            return ch
-
-    # Use difflib to find closest label
-    # difflib returns matches ordered by similarity
-    close = difflib.get_close_matches(user_input, candidates, n=3, cutoff=cutoff)
-    if close:
-        best = close[0]
-        return label_to_choice.get(best)
-
-    # Token overlap fallback: compare set intersection ratio
-    user_tokens = set([t for t in user_lower.split() if len(t) > 2])
-    best_choice = None
-    best_score = 0.0
-    for lab in candidates:
-        lab_tokens = set([t for t in lab.lower().split() if len(t) > 2])
-        if not lab_tokens or not user_tokens:
-            continue
-        inter = user_tokens.intersection(lab_tokens)
-        score = len(inter) / max(len(lab_tokens), 1)
-        if score > best_score:
-            best_score = score
-            best_choice = label_to_choice.get(lab)
-    if best_score >= 0.34:
-        return best_choice
-
-    # If nothing confident found, return None
-    return None
-
-# --- Async wrappers for story operations (to be used by tools) ---
-async def async_get_scene_for_session(sid: str) -> Dict[str, Any]:
-    session = get_session(sid)
-    if not session:
-        return {"error": "session_not_found"}
-    scene_id = session.get("current_scene")
-    if not scene_id:
-        return {"error": "no_current_scene"}
-    scene = await asyncio.to_thread(get_scene, scene_id)
-    return {"scene": format_scene_output(scene)}
-
-async def async_start_session(start_scene_override: Optional[str] = None) -> Dict[str, Any]:
-    sid = await asyncio.to_thread(new_session, start_scene_override)
-    # Immediately return the starting scene
-    scene_payload = await async_get_scene_for_session(sid)
-    return {"session_id": sid, **scene_payload}
-
-async def async_choose_option(sid: str, user_input: str) -> Dict[str, Any]:
-    session = get_session(sid)
-    if not session:
-        return {"error": "session_not_found", "message": "Session not found. Start a new game."}
-    current_scene_id = session.get("current_scene")
-    current_scene = await asyncio.to_thread(get_scene, current_scene_id)
-    if not current_scene:
-        return {"error": "scene_not_found", "message": "Current scene not found."}
-
-    chosen = await asyncio.to_thread(map_user_input_to_choice, current_scene, user_input)
-    if not chosen:
-        # Did not confidently map — return clarification request and available choices
-        available = _choice_labels_for_scene(current_scene)
-        return {
-            "error": "no_match",
-            "message": "I didn't understand which option you meant. Please pick one of the available choices or repeat it more clearly.",
-            "available_choices": available
+        player_name = self._get_player_info(chat_history)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Updated game name
+        save_data = {
+            "case": "Andie Bell Cold Case",
+            "investigator": player_name,
+            "save_time": timestamp,
+            "turns_count": len(chat_history),
+            "investigation_log": chat_history
         }
 
-    # Apply choice: advance scene
-    next_scene_id = chosen.get("next_scene")
-    # Record history
-    session["history"].append({
-        "at": datetime.utcnow().isoformat(),
-        "scene": current_scene_id,
-        "choice_label": chosen.get("label"),
-        "choice_id": chosen.get("id"),
-        "next_scene": next_scene_id
-    })
-    # If next_scene_id is None -> end
-    set_scene_for_session(sid, next_scene_id)
-    next_scene = await asyncio.to_thread(get_scene, next_scene_id) if next_scene_id else None
-    return {
-        "applied_choice": {"id": chosen.get("id"), "label": chosen.get("label"), "next_scene": next_scene_id},
-        "next_scene": format_scene_output(next_scene) if next_scene else None
-    }
+        filename = CASE_FILE_DIR.joinpath(f"{player_name}_Case_{timestamp}.json")
+        
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(save_data, f, indent=4)
+            logger.info("Case file saved to: %s", filename)
+            return f"✅ Case File logged successfully as {filename.name}."
+        except Exception as e:
+            logger.error("Error saving case file: %s", e)
+            return f"❌ Error saving case file: {e}"
 
-async def async_reset_session(sid: str) -> Dict[str, Any]:
-    session = get_session(sid)
-    if not session:
-        return {"error": "session_not_found"}
-    start_scene = STORY_DATA["meta"].get("start_scene")
-    set_scene_for_session(sid, start_scene)
-    return await async_get_scene_for_session(sid)
+    def start_new_investigation(self) -> str:
+        """The command to trigger the next session (after saving)."""
+        return "New case file opened. The red string board is blank. Welcome back to the investigation."
 
-# --- Tools exposed to the LLM / runtime ---
+
+# --- Initialize Logic Instance and Tool Function ---
+
+DETECTIVE_LOGIC = DetectiveLogic()
 
 @function_tool
-async def start_game_tool(ctx: RunContext[None], start_scene_override: Optional[str] = None) -> Dict[str, Any]:
+async def start_new_investigation_tool(ctx: RunContext) -> str: 
     """
-    Start a new story session. Returns:
-      { session_id: str, scene: {id,title,narration,lines,choices} }
+    Triggers the save sequence by accessing the current chat history, 
+    and then signals the LLM to start a new investigation.
     """
-    return await async_start_session(start_scene_override)
+    
+    # Ensure compatibility with different history formats if needed
+    if hasattr(ctx, 'history') and ctx.history:
+        try:
+            # Convert LiveKit history objects to a simple list of dicts
+            chat_history = [{'role': m.role, 'content': m.content} for m in ctx.history]
+        except AttributeError:
+            chat_history = ctx.history
 
-@function_tool
-async def get_scene_tool(ctx: RunContext[None], session_id: str) -> Dict[str, Any]:
-    """
-    Return the current scene payload for the given session_id.
-    """
-    return await async_get_scene_for_session(session_id)
+        # Save the current case file
+        save_message = await asyncio.to_thread(DETECTIVE_LOGIC.save_case_state, chat_history)
+        
+        # The tool returns the save message and the restart signal.
+        return save_message + " " + DETECTIVE_LOGIC.start_new_investigation()
+    
+    return "Could not save previous case file. " + DETECTIVE_LOGIC.start_new_investigation()
 
-@function_tool
-async def choose_option_tool(ctx: RunContext[None], session_id: str, user_spoken_choice: str) -> Dict[str, Any]:
-    """
-    Map a free-form user utterance (user_spoken_choice) to the best scene choice and advance the session.
-    Returns applied_choice + next_scene, or an error with available choices.
-    """
-    return await async_choose_option(session_id, user_spoken_choice)
 
-@function_tool
-async def reset_game_tool(ctx: RunContext[None], session_id: str) -> Dict[str, Any]:
-    """
-    Reset the session to the starting scene.
-    """
-    return await async_reset_session(session_id)
+# --- The LiveKit Detective Class (The Persona) ---
 
-# --- Agent / Assistant definition ---
-class StoryAssistant(Agent):
+class Detective(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions=(
-                "You are the Story Game Master guiding a player through an interactive mystery.\n"
-                "Always use the provided tools for story state: start_game_tool, get_scene_tool, choose_option_tool, reset_game_tool.\n"
-                "When a player speaks a choice, map it to one of the displayed choices using choose_option_tool.\n"
-                "If mapping fails, ask the player to repeat or read out the available choices.\n"
-                "Keep responses concise and focused on guiding the player and reading scene narration and lines.\n"
-                "Do NOT invent new scene IDs or change story.json."
-            ),
-            tools=[start_game_tool, get_scene_tool, choose_option_tool, reset_game_tool],
+            # Updated instructions for A Good Girl's Guide to Murder theme
+            instructions="""You are the **Detective Agent** for an interactive, single-player, voice-only investigation game based on the **Andie Bell Cold Case** from *A Good Girl's Guide to Murder*. Your role is to guide the player (who is acting as **Pip Fitz-Amobi**, the lead investigator) through the case, presenting suspects, clues, and leads.
+
+            **Universe & Tone:** You narrate a modern true-crime investigation setting (Fairview High/Little Kilton). The tone is focused, analytical, and slightly suspicious. The goal is to uncover the true killer, clearing the name of Sal Singh.
+
+            **Goal and Initial Setup (STRICTLY FOLLOW THIS FLOW):**
+            1. **First Turn:** You MUST immediately narrate the opening scene: Pip's small study, the red string investigation board, the *initial facts* of the case (Andie disappeared 5 years ago, Sal Singh convicted), and the first key pieces of evidence. **Do NOT ask for the player's name.**
+            2. **The Investigation:** The core puzzle is finding and interviewing witnesses and cross-referencing their statements to find the inconsistencies that lead to the real killer.
+            
+            **Core Rule: Quadruple Choice (STRICTLY ENFORCED):**
+            * Every single decision presented to the player **MUST** offer exactly **FOUR** distinct, labeled options: **(A), (B), (C), and (D).** These options must be investigative actions (e.g., Interview a suspect, Examine a piece of evidence, Re-read an old report).
+            * The story must be designed to last between **8 and 10 exchanges** total, leading to the identification of the real culprit or a major dead end.
+            
+            **Continuity:** You must perfectly remember the player's past actions, witness statements, and the state of the evidence.
+
+            **Action Prompt:** You **MUST** end every turn by presenting the four investigative options and asking: "**Which action (A, B, C, or D) do you choose for the investigation?**"
+            
+            **Special Command:** When the player asks to restart, they will trigger your `start_new_investigation_tool`. After the tool provides its output, you MUST reset the scene entirely by narrating the initial room description and case setup again.
+
+            **Your First Turn: Begin the Cold Case Investigation now!**
+            **Detective Agent:** You are **Pip Fitz-Amobi**, a determined student starting her Capstone project—investigating the murder of **Andie Bell** and the apparent suicide of her boyfriend, **Sal Singh**, five years ago. You sit in your study, surrounded by red string and photos. The official story is a closed case, but you’re certain Sal was innocent. Your evidence board is ready, displaying the first two facts: **Andie's phone was found** but was wiped clean, and **Sal had no history of violence**.
+
+            * **(A)** Re-examine the police report logs for all calls made the week Andie disappeared.
+            * **(B)** Track down and interview **Ravi Singh**, Sal's brother, for new insight.
+            * **(C)** Focus on the 'missing 60 minutes' in Sal's alibi before his apparent crime.
+            * **(D)** Scrutinize the social media profile of **Max Hastings**, a key witness with a known temper.
+
+            **Which action (A, B, C, or D) do you choose for the investigation?**
+            """,
+            tools=[start_new_investigation_tool] # Tool updated with the new name
         )
 
-# --- Prewarm and entrypoint (setup TTS/STT/LLM like your original) ---
-
 def prewarm(proc: JobProcess):
-    # load a VAD model once
     proc.userdata["vad"] = silero.VAD.load()
-    logger.info("Prewarmed VAD model.")
 
 async def entrypoint(ctx: JobContext):
-    """
-    Creates the AgentSession and starts the StoryAssistant.
-    This closely follows your original template but uses the story assistant.
-    """
-    # create the session with plugins configured (STT, LLM, TTS, turn detector, vad)
+    # Initialize the LLM, STT, and TTS components
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash", api_key=os.getenv("GOOGLE_API_KEY")),
-        tts=murf.TTS(voice="en-US-matthew", style="Conversation", text_pacing=True),
+        # Updated TTS style to be appropriate for a crime documentary/podcast narrator
+        tts=murf.TTS(voice="en-US-matthew", style="Documentary", text_pacing=True), 
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
 
-    # start session with the assistant
     await session.start(
-        agent=StoryAssistant(),
+        agent=Detective(), # Class name updated
         room=ctx.room,
     )
 
-    # connect
     await ctx.connect()
+
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
